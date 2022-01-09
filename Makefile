@@ -18,3 +18,6 @@ clean:
 
 update:
 	cargo update
+
+run:
+	cargo run --release

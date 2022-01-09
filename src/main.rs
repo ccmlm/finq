@@ -1,29 +1,268 @@
+#![allow(dead_code)]
+
 use {
+    bech32::ToBase32,
+    clap::Parser,
+    once_cell::sync::Lazy,
     ruc::*,
-    serde::Deserialize,
+    serde::{de::DeserializeOwned, Deserialize},
+    std::collections::HashSet,
     zei::{
         serialization::ZeiFromToBytes,
         xfr::{
-            sig::{XfrKeyPair, XfrPublicKey},
+            sig::XfrPublicKey,
             structs::{
-                AssetRecord, AssetType, BlindAssetRecord, XfrAmount, XfrAssetType, XfrBody,
-                ASSET_TYPE_LENGTH,
+                AssetType, BlindAssetRecord, XfrAmount, XfrAssetType, XfrBody, ASSET_TYPE_LENGTH,
             },
         },
     },
 };
+
+fn main() {
+    let args = Args::parse();
+
+    let mut recursive_depth = args.recursive_depth.unwrap_or(2);
+    let days_within = args.days_within.unwrap_or(7);
+
+    let mut addr_list = if let Some(l) = args.target_addr_list {
+        l
+    } else {
+        ADDR_LIST.iter().map(|a| a.to_string()).collect()
+    };
+    addr_list.sort_unstable();
+    addr_list.dedup();
+
+    if addr_list.is_empty() {
+        eprintln!("\x1b[31;1mAddress list is empty!\x1b[0m");
+        return;
+    }
+
+    let mut hist = HashSet::new();
+    let mut report = Report::default();
+    pnk!(trace(
+        &mut report,
+        addr_list,
+        days_within,
+        &mut hist,
+        &mut recursive_depth
+    ));
+
+    report_make_readable(&mut report);
+
+    dbg!(report);
+}
+
+fn trace(
+    report: &mut Report,
+    addr_list: Vec<FraAddr>,
+    days_within: u64,
+    hist: &mut HashSet<FraAddr>,
+    recursive_depth: &mut u8,
+) -> Result<()> {
+    if 0 == *recursive_depth {
+        return Ok(());
+    }
+    *recursive_depth -= 1;
+
+    let al = addr_list.into_iter().fold(vec![], |mut acc, new| {
+        if !hist.contains(&new) {
+            acc.push(new);
+        }
+        acc
+    });
+
+    let mut res = map! {};
+    let mut next_round = HashSet::new();
+    for addr in al.into_iter() {
+        let l = get_tx_list(&addr, days_within).c(d!())?;
+        for ops in l.into_iter().map(|tx| tx.tx.body.operations) {
+            for o in ops.into_iter() {
+                if let Operation::TransferAsset(o) = o {
+                    for output in o.body.transfer.outputs.into_iter() {
+                        let receiver = pubkey_to_bech32(&output.public_key);
+                        alt!(addr == receiver || is_fee_or_burn(&output), continue);
+                        next_round.insert(receiver.clone());
+                        let (confidential_cnt, am) =
+                            if let Some(am) = get_nonconfidential_balance(&output) {
+                                (0, am)
+                            } else {
+                                (1, 0)
+                            };
+                        let en = res.entry(output.public_key).or_insert(Receiver {
+                            addr: receiver,
+                            kind: gen_kind(&output),
+                            total_cnt: 0,
+                            confidential_cnt: 0,
+                            non_confidential_amount: 0,
+                            non_confidential_amount_readable: String::new(),
+                        });
+                        en.total_cnt += 1;
+                        en.confidential_cnt += confidential_cnt;
+                        en.non_confidential_amount += am;
+                    }
+                }
+            }
+        }
+        hist.insert(addr);
+    }
+
+    let (total_cnt, confidential_cnt, mut entries) =
+        res.into_iter().fold((0, 0, vec![]), |mut acc, (_, new)| {
+            acc.0 += 1;
+            acc.1 += new.confidential_cnt;
+            acc.2.push(new);
+            acc
+        });
+
+    entries.sort_unstable_by(|a, b| b.non_confidential_amount.cmp(&a.non_confidential_amount));
+
+    report.push(ReceiverSet {
+        total_cnt,
+        confidential_cnt,
+        non_confidential_amount_readable: String::new(),
+        entries,
+    });
+
+    let next_round = if next_round.is_empty() {
+        return Ok(());
+    } else {
+        next_round.into_iter().collect()
+    };
+
+    trace(report, next_round, days_within, hist, recursive_depth)
+}
+
+fn is_fee_or_burn(output: &BlindAssetRecord) -> bool {
+    output.public_key == *BH_PK
+}
+
+fn is_staking(output: &BlindAssetRecord) -> bool {
+    output.public_key == *BH_PK_STAKING
+}
+
+fn is_reserved(output: &BlindAssetRecord) -> bool {
+    ADDR_LIST.contains(&pubkey_to_bech32(&output.public_key).as_str())
+}
+
+fn gen_kind(o: &BlindAssetRecord) -> AddrKind {
+    if is_fee_or_burn(o) {
+        AddrKind::FeeOrBurn
+    } else if is_staking(o) {
+        AddrKind::StakingOrConvertToEvm
+    } else if is_reserved(o) {
+        AddrKind::Reserved
+    } else {
+        AddrKind::Normal
+    }
+}
+
+// fn height_to_days_ago(h: Height, latest_h: Height) -> u64 {
+//     latest_h.saturating_sub(h) * BLOCK_ITV_SECS / (24 * 3600)
+// }
+
+fn days_to_start_height(mut days_within: u64) -> Height {
+    if 0 == days_within {
+        days_within = 1;
+    }
+    days_within * 24 * 3600 / BLOCK_ITV_SECS
+}
+
+fn get_nonconfidential_balance(output: &BlindAssetRecord) -> Option<Amount> {
+    if let XfrAssetType::NonConfidential(ty) = output.asset_type {
+        if ASSET_TYPE_FRA == ty {
+            if let XfrAmount::NonConfidential(n) = output.amount {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn get_tx_list(addr: FraAddrRef, days_within: u64) -> Result<TxList> {
+    let start_height = (*LATEST_HEIGHT).saturating_sub(days_to_start_height(days_within));
+    let url = format!(
+        r#"{}:26657/tx_search?per_page=100&query="addr.from.{}='y'"&order_by="desc""#,
+        SERVER_URL, addr
+    );
+    let res = http_get::<HttpRes>(&url).c(d!())?;
+    let total_cnt = res.result.total_count.parse::<usize>().unwrap();
+    let mut res: TxList = res.into();
+    if 0 < total_cnt {
+        let mut page = 1;
+        let mut received_cnt = res.len();
+        let mut min_height = res.last().unwrap().height;
+        while start_height < min_height && total_cnt > received_cnt {
+            let url = format!("{}&page={}", &url, 1 + page);
+            let part: TxList = http_get::<HttpRes>(&url).c(d!())?.into();
+            res.extend_from_slice(&part);
+            page += 1;
+            received_cnt = res.len();
+            min_height = res.last().unwrap().height;
+        }
+    }
+
+    assert!(res.len() <= total_cnt);
+
+    Ok(res
+        .into_iter()
+        .filter(|r| r.height > start_height)
+        .collect())
+}
+
+fn get_latest_height() -> Result<Height> {
+    #[derive(Deserialize)]
+    struct Res {
+        result: Ret,
+    }
+    #[derive(Deserialize)]
+    struct Ret {
+        block_height: String,
+    }
+    let url = format!("{}:26657/validators?per_page=1", SERVER_URL);
+    http_get::<Res>(&url)
+        .c(d!())
+        .and_then(|r| r.result.block_height.parse::<Height>().c(d!()))
+}
+
+fn http_get<T: DeserializeOwned>(url: &str) -> Result<T> {
+    attohttpc::get(url).send().c(d!())?.json::<T>().c(d!())
+}
+
+fn pubkey_to_bech32(key: &XfrPublicKey) -> FraAddr {
+    bech32enc(&XfrPublicKey::zei_to_bytes(key))
+}
+
+fn bech32enc<T: AsRef<[u8]> + ToBase32>(input: &T) -> FraAddr {
+    bech32::encode("fra", input.to_base32()).unwrap()
+}
+
+// fn pubkey_from_bech32(addr: FraAddrRef) -> Result<XfrPublicKey> {
+//     bech32dec(addr)
+//         .c(d!())
+//         .and_then(|bytes| XfrPublicKey::zei_from_bytes(&bytes).c(d!()))
+// }
+//
+// fn bech32dec(input: FraAddrRef) -> Result<Vec<u8>> {
+//     bech32::decode(input)
+//         .c(d!())
+//         .and_then(|(_, data)| Vec::<u8>::from_base32(&data).c(d!()))
+// }
 
 const PK_LEN: usize = ed25519_dalek::PUBLIC_KEY_LENGTH;
 const BH_PK_BYTES: [u8; PK_LEN] = [0; PK_LEN];
 const BH_PK_STAKING_BYTES: [u8; PK_LEN] = [1; PK_LEN];
 
 const ASSET_TYPE_FRA: AssetType = AssetType([0; ASSET_TYPE_LENGTH]);
-const FRA_DECIMALS: u8 = 6;
+const FRA_DECIMALS: u32 = 6;
 
-lazy_static::lazy_static! {
-    static ref BH_PK: XfrPublicKey = pnk!(XfrPublicKey::zei_from_bytes(&BH_PK_BYTES[..]));
-    static ref BH_PK_STAKING: XfrPublicKey = pnk!(XfrPublicKey::zei_from_bytes(&BH_PK_STAKING_BYTES[..]));
-}
+const BLOCK_ITV_SECS: u64 = 16;
+
+static BH_PK: Lazy<XfrPublicKey> =
+    Lazy::new(|| pnk!(XfrPublicKey::zei_from_bytes(&BH_PK_BYTES[..])));
+static BH_PK_STAKING: Lazy<XfrPublicKey> =
+    Lazy::new(|| pnk!(XfrPublicKey::zei_from_bytes(&BH_PK_STAKING_BYTES[..])));
+
+static LATEST_HEIGHT: Lazy<Height> = Lazy::new(|| pnk!(get_latest_height()));
 
 const ADDR_LIST: [&str; 9] = [
     "fra1s9c6p0656as48w8su2gxntc3zfuud7m66847j6yh7n8wezazws3s68p0m9",
@@ -37,43 +276,101 @@ const ADDR_LIST: [&str; 9] = [
     "fra1dkn9w5c674grdl6gmvj0s8zs0z2nf39zrmp3dpq5rqnnf9axwjrqexqnd6", // foundation account
 ];
 
-fn main() {
-    // https://prod-mainnet.prod.findora.org:26657/tx_search?per_page=100&query=%22addr.from.fra1dkn9w5c674grdl6gmvj0s8zs0z2nf39zrmp3dpq5rqnnf9axwjrqexqnd6=%27y%27%22
+const SERVER_URL: &str = "https://prod-mainnet.prod.findora.org";
+
+type Report = Vec<ReceiverSet>;
+
+fn report_make_readable(r: &mut Report) {
+    r.iter_mut().for_each(|r| {
+        let (tc, cc, non_c_am) = r.entries.iter().fold((0, 0, 0), |acc, new| {
+            (
+                acc.0 + new.total_cnt,
+                acc.1 + new.confidential_cnt,
+                acc.1 + new.non_confidential_amount,
+            )
+        });
+        r.total_cnt = tc;
+        r.confidential_cnt = cc;
+        r.non_confidential_amount_readable = to_float_str(non_c_am);
+        r.entries.iter_mut().for_each(|r| {
+            r.non_confidential_amount_readable = to_float_str(r.non_confidential_amount);
+        })
+    });
 }
 
-fn get_nonconfidential_balance(txo: &BlindAssetRecord) -> Option<u64> {
-    if let XfrAmount::NonConfidential(n) = txo.amount {
-        Some(n)
-    } else {
-        None
-    }
+#[derive(Default, Debug)]
+struct ReceiverSet {
+    total_cnt: u64,
+    confidential_cnt: u64,
+    non_confidential_amount_readable: String,
+    entries: Vec<Receiver>,
 }
 
-#[derive(Clone, Debug)]
-struct Res {
-    txs: Vec<Tx>,
-    total_count: u64,
+#[derive(Debug)]
+struct Receiver {
+    addr: FraAddr,
+    kind: AddrKind,
+    total_cnt: u64,
+    confidential_cnt: u64,
+    non_confidential_amount: Amount,
+    non_confidential_amount_readable: String,
 }
 
-impl From<HttpRes> for Res {
-    fn from(r: HttpRes) -> Self {
-        todo!()
+fn to_float_str(n: u64) -> String {
+    let i = n / 10_u64.pow(FRA_DECIMALS);
+    let j = n - i * 10_u64.pow(FRA_DECIMALS);
+    (i.to_string() + "." + j.to_string().trim_end_matches('0'))
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+#[derive(Debug)]
+enum AddrKind {
+    Normal,
+    FeeOrBurn,
+    StakingOrConvertToEvm,
+    Reserved,
+}
+
+type Height = u64;
+type Amount = u64;
+type FraAddr = String;
+type FraAddrRef<'a> = &'a str;
+
+type TxList = Vec<Tx>;
+
+impl From<HttpRes> for TxList {
+    fn from(t: HttpRes) -> Self {
+        t.result
+            .txs
+            .into_iter()
+            .filter(|tx| 0 == tx.tx_result.code)
+            .map(|tx| tx.into())
+            .collect()
     }
 }
 
 #[derive(Clone, Debug)]
 struct Tx {
-    height: u64,
-    successful: bool,
+    height: Height,
     tx: Transaction,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+impl From<HttpTx> for Tx {
+    fn from(t: HttpTx) -> Self {
+        let height = t.height.parse::<Height>().unwrap();
+        let tx = base64::decode(&t.tx).unwrap();
+        let tx = serde_json::from_slice::<Transaction>(&tx).unwrap_or_default();
+        Tx { height, tx }
+    }
+}
+
+#[derive(Clone, Default, Debug, Deserialize)]
 struct Transaction {
     body: TransactionBody,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Default, Debug, Deserialize)]
 struct TransactionBody {
     operations: Vec<Operation>,
 }
@@ -81,6 +378,30 @@ struct TransactionBody {
 #[derive(Clone, Debug, Deserialize)]
 enum Operation {
     TransferAsset(TransferAsset),
+    #[serde(skip_deserializing)]
+    IssueAsset,
+    #[serde(skip_deserializing)]
+    DefineAsset,
+    #[serde(skip_deserializing)]
+    UpdateMemo,
+    #[serde(skip_deserializing)]
+    UpdateStaker,
+    #[serde(skip_deserializing)]
+    Delegation,
+    #[serde(skip_deserializing)]
+    UnDelegation,
+    #[serde(skip_deserializing)]
+    Claim,
+    #[serde(skip_deserializing)]
+    UpdateValidator,
+    #[serde(skip_deserializing)]
+    Governance,
+    #[serde(skip_deserializing)]
+    FraDistribution,
+    #[serde(skip_deserializing)]
+    MintFra,
+    #[serde(skip_deserializing)]
+    ConvertAccount,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -93,25 +414,36 @@ struct TransferAssetBody {
     transfer: Box<XfrBody>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 struct HttpRes {
     result: HttpRet,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 struct HttpRet {
     txs: Vec<HttpTx>,
     total_count: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 struct HttpTx {
     height: String,
     tx_result: HttpTxResult,
     tx: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 struct HttpTxResult {
-    code: u8,
+    code: u64,
+}
+
+#[derive(Parser, Debug)]
+#[clap(about, version, author)]
+struct Args {
+    #[clap(short, long, help = "Optional, span of recent days, default to 7")]
+    days_within: Option<u64>,
+    #[clap(short, long)]
+    recursive_depth: Option<u8>,
+    #[clap(short, long, help = "Optional, default to the 9 reserved addresses")]
+    target_addr_list: Option<Vec<FraAddr>>,
 }
