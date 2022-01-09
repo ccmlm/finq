@@ -1,4 +1,4 @@
-all: lint
+all: release_musl
 
 lint:
 	cargo clippy
@@ -8,6 +8,9 @@ build:
 
 release:
 	cargo build --release
+
+release_musl:
+	cargo build --release --target=x86_64-unknown-linux-musl
 
 fmt:
 	cargo fmt
