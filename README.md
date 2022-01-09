@@ -28,11 +28,11 @@ make release
 **Outputs:**
 
 ```
-report = [
+[
     ReceiverSet {
         total_cnt: 3,
         confidential_cnt: 0,
-        non_confidential_amount_readable: "82111181.23781",
+        non_confidential_amount_readable: "1972111181.22781",
         entries: [
             Receiver {
                 addr: "fra1dkn9w5c674grdl6gmvj0s8zs0z2nf39zrmp3dpq5rqnnf9axwjrqexqnd6",
@@ -67,7 +67,7 @@ report = [
 
 ```shell
 make release
-./target/release/finq -d 100 -r 2
+./target/release/finq -d 360 -r 3
 ```
 
 **Outputs:** [**example.log**](./example.log)

@@ -136,7 +136,7 @@ fn is_fee_or_burn(output: &BlindAssetRecord) -> bool {
     output.public_key == *BH_PK
 }
 
-fn is_staking(output: &BlindAssetRecord) -> bool {
+fn is_staking_or_evm_conversion(output: &BlindAssetRecord) -> bool {
     output.public_key == *BH_PK_STAKING
 }
 
@@ -147,8 +147,8 @@ fn is_reserved(output: &BlindAssetRecord) -> bool {
 fn gen_kind(o: &BlindAssetRecord) -> AddrKind {
     if is_fee_or_burn(o) {
         AddrKind::FeeOrBurn
-    } else if is_staking(o) {
-        AddrKind::StakingOrConvertToEvm
+    } else if is_staking_or_evm_conversion(o) {
+        AddrKind::StakingOrEvmConversion
     } else if is_reserved(o) {
         AddrKind::Reserved
     } else {
@@ -193,11 +193,15 @@ fn get_tx_list(addr: FraAddrRef, days_within: u64) -> Result<TxList> {
         let mut min_height = res.last().unwrap().height;
         while start_height < min_height && total_cnt > received_cnt {
             let url = format!("{}&page={}", &url, 1 + page);
-            let part: TxList = http_get::<HttpRes>(&url).c(d!())?.into();
-            res.extend_from_slice(&part);
-            page += 1;
-            received_cnt = res.len();
-            min_height = res.last().unwrap().height;
+            if let Ok(part) = info!(http_get::<HttpRes>(&url)) {
+                let part: TxList = part.into();
+                res.extend_from_slice(&part);
+                page += 1;
+                received_cnt = res.len();
+                min_height = res.last().unwrap().height;
+            } else {
+                break;
+            }
         }
     }
 
@@ -286,7 +290,7 @@ fn report_make_readable(r: &mut Report) {
             (
                 acc.0 + new.total_cnt,
                 acc.1 + new.confidential_cnt,
-                acc.1 + new.non_confidential_amount,
+                acc.2 + new.non_confidential_amount,
             )
         });
         r.total_cnt = tc;
@@ -328,7 +332,7 @@ fn to_float_str(n: u64) -> String {
 enum AddrKind {
     Normal,
     FeeOrBurn,
-    StakingOrConvertToEvm,
+    StakingOrEvmConversion,
     Reserved,
 }
 
