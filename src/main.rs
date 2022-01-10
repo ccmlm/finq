@@ -84,7 +84,7 @@ fn trace(
                 if let Operation::TransferAsset(o) = o {
                     for output in o.body.transfer.outputs.into_iter() {
                         let receiver = pubkey_to_bech32(&output.public_key);
-                        alt!(addr == receiver || is_fee_or_burn(&output), continue);
+                        alt!(addr == receiver, continue);
                         next_round.insert(receiver.clone());
                         let (confidential_cnt, am) =
                             if let Some(am) = get_nonconfidential_balance(&output) {
@@ -387,29 +387,29 @@ struct TransactionBody {
 #[derive(Clone, Debug, Deserialize)]
 enum Operation {
     TransferAsset(TransferAsset),
-    #[serde(skip_deserializing)]
+    #[serde(skip)]
     IssueAsset,
-    #[serde(skip_deserializing)]
+    #[serde(skip)]
     DefineAsset,
-    #[serde(skip_deserializing)]
+    #[serde(skip)]
     UpdateMemo,
-    #[serde(skip_deserializing)]
+    #[serde(skip)]
     UpdateStaker,
-    #[serde(skip_deserializing)]
+    #[serde(skip)]
     Delegation,
-    #[serde(skip_deserializing)]
+    #[serde(skip)]
     UnDelegation,
-    #[serde(skip_deserializing)]
+    #[serde(skip)]
     Claim,
-    #[serde(skip_deserializing)]
+    #[serde(skip)]
     UpdateValidator,
-    #[serde(skip_deserializing)]
+    #[serde(skip)]
     Governance,
-    #[serde(skip_deserializing)]
+    #[serde(skip)]
     FraDistribution,
-    #[serde(skip_deserializing)]
+    #[serde(skip)]
     MintFra,
-    #[serde(skip_deserializing)]
+    #[serde(skip)]
     ConvertAccount,
 }
 
