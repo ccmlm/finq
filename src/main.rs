@@ -12,7 +12,8 @@ use {
         xfr::{
             sig::XfrPublicKey,
             structs::{
-                AssetType, BlindAssetRecord, XfrAmount, XfrAssetType, XfrBody, ASSET_TYPE_LENGTH,
+                AssetType, BlindAssetRecord, OwnerMemo, XfrAmount, XfrAssetType, XfrBody,
+                ASSET_TYPE_LENGTH,
             },
         },
     },
@@ -81,20 +82,20 @@ fn trace(
         let l = get_tx_list(&addr, days_within).c(d!())?;
         for ops in l.into_iter().map(|tx| tx.tx.body.operations) {
             for o in ops.into_iter() {
-                if let Operation::TransferAsset(o) = o {
-                    for output in o.body.transfer.outputs.into_iter() {
-                        let receiver = pubkey_to_bech32(&output.public_key);
+                macro_rules! op {
+                    ($output: expr) => {
+                        let receiver = pubkey_to_bech32(&$output.public_key);
                         alt!(addr == receiver, continue);
                         next_round.insert(receiver.clone());
                         let (confidential_cnt, am) =
-                            if let Some(am) = get_nonconfidential_balance(&output) {
+                            if let Some(am) = get_nonconfidential_balance(&$output) {
                                 (0, am)
                             } else {
                                 (1, 0)
                             };
-                        let en = res.entry(output.public_key).or_insert(Receiver {
+                        let en = res.entry($output.public_key).or_insert(Receiver {
                             addr: receiver,
-                            kind: gen_kind(&output),
+                            kind: gen_kind(&$output),
                             total_cnt: 0,
                             confidential_cnt: 0,
                             non_confidential_amount: 0,
@@ -103,8 +104,21 @@ fn trace(
                         en.total_cnt += 1;
                         en.confidential_cnt += confidential_cnt;
                         en.non_confidential_amount += am;
-                    }
+                    };
                 }
+                match o {
+                    Operation::TransferAsset(o) => {
+                        for output in o.body.transfer.outputs.into_iter() {
+                            op!(output);
+                        }
+                    }
+                    Operation::IssueAsset(o) => {
+                        for output in o.body.records.into_iter().map(|r| r.0.record) {
+                            op!(output);
+                        }
+                    }
+                    _ => (),
+                };
             }
         }
         hist.insert(addr);
@@ -270,7 +284,8 @@ static BH_PK: Lazy<XfrPublicKey> =
 static BH_PK_STAKING: Lazy<XfrPublicKey> =
     Lazy::new(|| pnk!(XfrPublicKey::zei_from_bytes(&BH_PK_STAKING_BYTES[..])));
 static SERVER_URL: Lazy<String> = Lazy::new(|| {
-    env::var("FINQ_SERVER_URL").unwrap_or("https://prod-mainnet.prod.findora.org".to_owned())
+    env::var("FINQ_SERVER_URL")
+        .unwrap_or_else(|_| "https://prod-mainnet.prod.findora.org".to_owned())
 });
 
 static LATEST_HEIGHT: Lazy<Height> = Lazy::new(|| pnk!(get_latest_height()));
@@ -387,16 +402,14 @@ struct TransactionBody {
 #[derive(Clone, Debug, Deserialize)]
 enum Operation {
     TransferAsset(TransferAsset),
-    #[serde(skip)]
-    IssueAsset,
+    IssueAsset(IssueAsset),
     #[serde(skip)]
     DefineAsset,
     #[serde(skip)]
     UpdateMemo,
     #[serde(skip)]
     UpdateStaker,
-    #[serde(skip)]
-    Delegation,
+    Delegation(DelegationOps),
     #[serde(skip)]
     UnDelegation,
     #[serde(skip)]
@@ -410,7 +423,7 @@ enum Operation {
     #[serde(skip)]
     MintFra,
     #[serde(skip)]
-    ConvertAccount,
+    ConvertAccount(ConvertAccount),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -422,6 +435,37 @@ struct TransferAsset {
 struct TransferAssetBody {
     transfer: Box<XfrBody>,
 }
+
+#[derive(Clone, Debug, Deserialize)]
+struct IssueAsset {
+    body: IssueAssetBody,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct IssueAssetBody {
+    records: Vec<(TxOutput, Option<OwnerMemo>)>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct DelegationOps {}
+
+// #[derive(Clone, Debug, Deserialize)]
+// struct MintFraOps {
+//     entries: Vec<MintEntry>,
+// }
+//
+// #[derive(Clone, Debug, Deserialize)]
+// struct MintEntry {
+//     utxo: TxOutput,
+// }
+
+#[derive(Clone, Debug, Deserialize)]
+struct TxOutput {
+    record: BlindAssetRecord,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ConvertAccount {}
 
 #[derive(Deserialize)]
 struct HttpRes {
