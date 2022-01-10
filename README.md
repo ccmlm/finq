@@ -67,7 +67,7 @@ make release
 
 ```shell
 make release
-./target/release/finq -d 360 -r 3
+./target/release/finq -d 360 -r 10 -l
 ```
 
 **Outputs:** [**example.log**](./example.log)

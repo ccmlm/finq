@@ -6,7 +6,7 @@ use {
     once_cell::sync::Lazy,
     ruc::*,
     serde::{de::DeserializeOwned, Deserialize},
-    std::collections::HashSet,
+    std::{collections::HashSet, env},
     zei::{
         serialization::ZeiFromToBytes,
         xfr::{
@@ -20,6 +20,10 @@ use {
 
 fn main() {
     let args = Args::parse();
+
+    if args.localhost {
+        env::set_var("FINQ_SERVER_URL", "http://localhost");
+    }
 
     let mut recursive_depth = args.recursive_depth.unwrap_or(2);
     let days_within = args.days_within.unwrap_or(7);
@@ -182,7 +186,7 @@ fn get_tx_list(addr: FraAddrRef, days_within: u64) -> Result<TxList> {
     let start_height = (*LATEST_HEIGHT).saturating_sub(days_to_start_height(days_within));
     let url = format!(
         r#"{}:26657/tx_search?per_page=100&query="addr.from.{}='y'"&order_by="desc""#,
-        SERVER_URL, addr
+        &*SERVER_URL, addr
     );
     let res = http_get::<HttpRes>(&url).c(d!())?;
     let total_cnt = res.result.total_count.parse::<usize>().unwrap();
@@ -222,7 +226,7 @@ fn get_latest_height() -> Result<Height> {
     struct Ret {
         block_height: String,
     }
-    let url = format!("{}:26657/validators?per_page=1", SERVER_URL);
+    let url = format!("{}:26657/validators?per_page=1", &*SERVER_URL);
     http_get::<Res>(&url)
         .c(d!())
         .and_then(|r| r.result.block_height.parse::<Height>().c(d!()))
@@ -265,6 +269,9 @@ static BH_PK: Lazy<XfrPublicKey> =
     Lazy::new(|| pnk!(XfrPublicKey::zei_from_bytes(&BH_PK_BYTES[..])));
 static BH_PK_STAKING: Lazy<XfrPublicKey> =
     Lazy::new(|| pnk!(XfrPublicKey::zei_from_bytes(&BH_PK_STAKING_BYTES[..])));
+static SERVER_URL: Lazy<String> = Lazy::new(|| {
+    env::var("FINQ_SERVER_URL").unwrap_or("https://prod-mainnet.prod.findora.org".to_owned())
+});
 
 static LATEST_HEIGHT: Lazy<Height> = Lazy::new(|| pnk!(get_latest_height()));
 
@@ -279,8 +286,6 @@ const ADDR_LIST: [&str; 9] = [
     "fra1whn756rtqt3gpsmdlw6pvns75xdh3ttqslvxaf7eefwa83pcnlhsree9gv",
     "fra1dkn9w5c674grdl6gmvj0s8zs0z2nf39zrmp3dpq5rqnnf9axwjrqexqnd6", // foundation account
 ];
-
-const SERVER_URL: &str = "https://prod-mainnet.prod.findora.org";
 
 type Report = Vec<ReceiverSet>;
 
@@ -450,4 +455,6 @@ struct Args {
     recursive_depth: Option<u8>,
     #[clap(short, long, help = "Optional, default to the 9 reserved addresses")]
     target_addr_list: Option<Vec<FraAddr>>,
+    #[clap(short, long, help = "Use `http://localhost` as 'SERVER_URL'")]
+    localhost: bool,
 }

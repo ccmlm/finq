@@ -1,4 +1,4 @@
-all: release_musl
+all: release
 
 lint:
 	cargo clippy
@@ -7,10 +7,11 @@ build:
 	cargo build
 
 release:
-	cargo build --release
-
-release_musl:
-	cargo build --release --target=x86_64-unknown-linux-musl
+	if [[ "Linux" == `uname -s` ]]; then\
+	    cargo build --release --target=x86_64-unknown-linux-musl;\
+	else\
+	    cargo build --release;\
+	fi
 
 fmt:
 	cargo fmt
